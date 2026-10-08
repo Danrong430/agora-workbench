@@ -1393,7 +1393,7 @@ class CodeExecutionServer(BaseMCPServer):
             except Exception as e:
                 LOGGER.warning(f"Failed to extract tool call trace: {e}")
 
-        return execution_result
+        return self._truncate_output_if_needed(execution_result)
 
     async def _execute_code_with_tracing(self, code: str, timeout: int) -> CodeExecutionResult:
         """
