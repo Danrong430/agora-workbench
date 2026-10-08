@@ -73,7 +73,7 @@ async def test_execute_tool_has_no_duplicate_structured_content():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_execute_tool_returns_compact_failed_tool_calls():
+async def test_execute_tool_omits_failed_internal_tool_calls():
     server = CodeExecutionServer(
         server_config=ServerConfig(
             name="test_direct",
@@ -123,12 +123,4 @@ async def test_execute_tool_returns_compact_failed_tool_calls():
     payload = json.loads(result.content[0].text)
     assert payload["success"] is True
     assert "tool_calls" not in payload
-    assert payload["failed_tool_calls"] == [
-        {
-            "call_index": 2,
-            "tool_name": "failed_tool",
-            "duration_ms": 20.0,
-            "success": False,
-            "error": "ValueError: invalid input",
-        }
-    ]
+    assert "failed_tool_calls" not in payload

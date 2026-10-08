@@ -2,12 +2,12 @@
 
 import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 from pydantic import ValidationError
 
-from ..code_execution import _publish_job_finished_when_done, build_check_job_tool, build_tool
+from ..code_execution import build_check_job_tool, build_tool
 from ..code_execution_models import ServerConfig
 from ..sessions import set_current_session
 
@@ -293,16 +293,7 @@ async def test_adaptive_slow_execution_promotes_to_background(test_server):
 
 
 @pytest.mark.asyncio
-async def test_check_job_returns_only_failed_tool_call_details(test_server, monkeypatch):
-    failed_tool_calls = [
-        {
-            "call_index": 2,
-            "tool_name": "failed_tool",
-            "duration_ms": 20.0,
-            "success": False,
-            "error": "RuntimeError: failed",
-        },
-    ]
+async def test_check_job_does_not_flush_or_return_internal_tool_calls(test_server, monkeypatch):
     monkeypatch.setattr(
         test_server.session_manager,
         "check_background_job",
@@ -310,11 +301,10 @@ async def test_check_job_returns_only_failed_tool_call_details(test_server, monk
             "status": "failed",
             "session_id": "session-1",
             "success": False,
+            "tool_calls": [{"tool_name": "failed_tool", "result": {"large": "not returned"}}],
         },
     )
-    await_failures = AsyncMock(return_value=failed_tool_calls)
     execute_code = AsyncMock()
-    monkeypatch.setattr(test_server.session_manager, "await_background_tool_failures", await_failures)
     monkeypatch.setattr(
         test_server.session_manager,
         "execute_code_for_session",
@@ -322,76 +312,11 @@ async def test_check_job_returns_only_failed_tool_call_details(test_server, monk
     )
 
     check_job = build_check_job_tool(test_server)
-    first_result = json.loads(await check_job(None, "job-1"))
-    second_result = json.loads(await check_job(None, "job-1"))
+    result = json.loads(await check_job(None, "job-1"))
 
-    assert "tool_calls" not in first_result
-    assert first_result["failed_tool_calls"] == failed_tool_calls
-    assert second_result["failed_tool_calls"] == failed_tool_calls
-    assert await_failures.await_count == 2
+    assert "tool_calls" not in result
+    assert "failed_tool_calls" not in result
     execute_code.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_job_completion_flushes_trace_once_and_caches_failures(test_server, monkeypatch):
-    raw_calls = [
-        {
-            "tool_name": "successful_tool",
-            "args": {"large": "input"},
-            "result": {"large": "output"},
-            "duration_ms": 10,
-            "success": True,
-        },
-        {
-            "tool_name": "failed_tool",
-            "args": {"secret": "activity only"},
-            "result": {},
-            "duration_ms": 20,
-            "success": False,
-            "error": "RuntimeError: failed",
-        },
-    ]
-    monkeypatch.setattr(
-        test_server.session_manager,
-        "await_background_job",
-        AsyncMock(
-            return_value={
-                "status": "failed",
-                "success": False,
-                "stdout": "",
-                "stderr": "traceback",
-                "error": "execution failed",
-                "elapsed_seconds": 1.0,
-            }
-        ),
-    )
-    monkeypatch.setattr(test_server, "_tool_tracing_active", lambda _session_id: True)
-    execute_code = AsyncMock(return_value=(json.dumps(raw_calls), "", True, [], []))
-    monkeypatch.setattr(test_server.session_manager, "execute_code_for_session", execute_code)
-    cache_failures = MagicMock()
-    monkeypatch.setattr(test_server.session_manager, "complete_background_tool_trace", cache_failures)
-    test_server.activity_publisher.publish_nowait = MagicMock()
-
-    await _publish_job_finished_when_done(test_server, "session-1", "job-1")
-
-    execute_code.assert_awaited_once()
-    cache_failures.assert_called_once_with(
-        "job-1",
-        [
-            {
-                "call_index": 2,
-                "tool_name": "failed_tool",
-                "duration_ms": 20.0,
-                "success": False,
-                "error": "RuntimeError: failed",
-            }
-        ],
-    )
-    activity_event = test_server.activity_publisher.publish_nowait.call_args.args[0]
-    assert len(activity_event["tool_calls"]) == 2
-    assert activity_event["tool_calls"][0]["args"] == {"large": "input"}
-    assert activity_event["tool_calls"][0]["result"] == {"large": "output"}
-    assert activity_event["tool_calls"][1]["error"] == "RuntimeError: failed"
 
 
 # ============================================================================

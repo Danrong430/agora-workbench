@@ -12,10 +12,9 @@ changes that require action from existing users. Each entry there states who is 
 
 ### Changed
 
-- Code-execution MCP responses no longer include successful internal tool-call
-  arguments or results. Failed internal calls are returned as compact
-  `failed_tool_calls` diagnostics, while complete traces remain available to
-  activity-event consumers.
+- Code-execution MCP responses no longer include internal tool-call arguments
+  or results. Agents receive only top-level execution output, while complete
+  traces remain available to activity-event consumers.
 
 ## [0.3.3] - 2026-10-06
 
