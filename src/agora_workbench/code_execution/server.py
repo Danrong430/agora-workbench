@@ -2535,7 +2535,7 @@ else:
                 item["result_variable"] = batch["result_variable"]
                 item["result"] = job.get("result_payload")
                 if job.get("result"):
-                    item["execution"] = job["result"]
+                    item["execution"] = execution_defaults._agent_execution_payload(job["result"])
             job_payloads.append(item)
 
         if running > 0:

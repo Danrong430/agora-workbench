@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 from pydantic import ValidationError
 
-from ..code_execution import build_tool
+from ..code_execution import build_check_job_tool, build_tool
 from ..code_execution_models import ServerConfig
 from ..sessions import set_current_session
 
@@ -290,6 +290,56 @@ async def test_adaptive_slow_execution_promotes_to_background(test_server):
     assert final_status["status"] == "completed"
     assert final_status["success"] is True
     assert "slow result" in final_status["stdout"]
+
+
+@pytest.mark.asyncio
+async def test_check_job_returns_only_failed_tool_call_details(test_server, monkeypatch):
+    raw_calls = [
+        {
+            "tool_name": "successful_tool",
+            "args": {"large": "input"},
+            "result": {"large": "output"},
+            "duration_ms": 10,
+            "success": True,
+        },
+        {
+            "tool_name": "failed_tool",
+            "args": {"secret": "not returned"},
+            "result": {"large": "not returned"},
+            "duration_ms": 20,
+            "success": False,
+            "error": "RuntimeError: failed",
+        },
+    ]
+    monkeypatch.setattr(
+        test_server.session_manager,
+        "check_background_job",
+        lambda _job_id, caller_identity=None: {
+            "status": "failed",
+            "session_id": "session-1",
+            "success": False,
+        },
+    )
+    monkeypatch.setattr(test_server, "_tool_tracing_active", lambda _session_id: True)
+    monkeypatch.setattr(
+        test_server.session_manager,
+        "execute_code_for_session",
+        AsyncMock(return_value=(json.dumps(raw_calls), "", True, [], [])),
+    )
+
+    check_job = build_check_job_tool(test_server)
+    result = json.loads(await check_job(None, "job-1"))
+
+    assert "tool_calls" not in result
+    assert result["failed_tool_calls"] == [
+        {
+            "call_index": 2,
+            "tool_name": "failed_tool",
+            "duration_ms": 20.0,
+            "success": False,
+            "error": "RuntimeError: failed",
+        }
+    ]
 
 
 # ============================================================================

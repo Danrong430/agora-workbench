@@ -6,7 +6,7 @@ import json
 import logging
 import os
 import sys
-from typing import Awaitable, Callable, Optional, TYPE_CHECKING
+from typing import Any, Awaitable, Callable, Optional, TYPE_CHECKING
 
 from fastapi import HTTPException
 from fastmcp import Context
@@ -108,6 +108,42 @@ def _saved_files_for_event(server: "CodeExecutionServer", session_id: str, artif
         }
         for a in artifacts
     ]
+
+
+def _failed_tool_call_details(tool_calls: list[ToolCallRecord | dict[str, Any]]) -> list[dict[str, Any]]:
+    """Project internal traces to the failure details useful to an agent."""
+    failures: list[dict[str, Any]] = []
+    for call_index, raw_call in enumerate(tool_calls, start=1):
+        call = raw_call if isinstance(raw_call, ToolCallRecord) else ToolCallRecord.model_validate(raw_call)
+        if call.success:
+            continue
+        failures.append(
+            {
+                "call_index": call_index,
+                "tool_name": call.tool_name,
+                "duration_ms": call.duration_ms,
+                "success": False,
+                "error": call.error,
+            }
+        )
+    return failures
+
+
+def _agent_execution_payload(result: CodeExecutionResult | dict[str, Any]) -> dict[str, Any]:
+    """Return execution data without successful internal tool-call traces."""
+    if isinstance(result, CodeExecutionResult):
+        payload = result.model_dump(exclude={"displays", "tool_calls"})
+        tool_calls: list[ToolCallRecord | dict[str, Any]] = list(result.tool_calls)
+    else:
+        payload = dict(result)
+        raw_tool_calls = payload.pop("tool_calls", [])
+        payload.pop("displays", None)
+        tool_calls = raw_tool_calls if isinstance(raw_tool_calls, list) else []
+
+    failed_tool_calls = _failed_tool_call_details(tool_calls)
+    if failed_tool_calls:
+        payload["failed_tool_calls"] = failed_tool_calls
+    return payload
 
 
 def _absolute_path_error(val: str, allowed_prefixes: "tuple[str, ...]") -> str:
@@ -877,7 +913,7 @@ def build_tool(server: "CodeExecutionServer") -> "Callable[..., Awaitable[str]]"
             # payloads ride the activity event).  Lightweight artifact names are
             # included so the agent knows what files are available for publishing
             # via <gui>name</gui>.
-            result_dict = result.model_dump(exclude={"displays"})
+            result_dict = _agent_execution_payload(result)
             # Strip download tokens from artifact metadata — agent only needs
             # names/sizes to decide what to publish.
             result_dict["artifacts"] = [
@@ -903,7 +939,7 @@ def build_tool(server: "CodeExecutionServer") -> "Callable[..., Awaitable[str]]"
                 return json.dumps(e.detail, indent=2)
             LOGGER.error(f"Execution failed: {e}", exc_info=True)
             error_result = CodeExecutionResult(success=False, error=str(e), description=description)
-            error_dict = error_result.model_dump()
+            error_dict = _agent_execution_payload(error_result)
             if session:
                 error_dict["session_id"] = session.session_id
             server.activity_publisher.publish_nowait(
@@ -920,7 +956,7 @@ def build_tool(server: "CodeExecutionServer") -> "Callable[..., Awaitable[str]]"
         except Exception as e:
             LOGGER.error(f"Execution failed: {e}", exc_info=True)
             error_result = CodeExecutionResult(success=False, error=str(e), description=description)
-            error_dict = error_result.model_dump()
+            error_dict = _agent_execution_payload(error_result)
             if session:
                 error_dict["session_id"] = session.session_id
             server.activity_publisher.publish_nowait(
@@ -1018,8 +1054,10 @@ def build_check_job_tool(server: "CodeExecutionServer") -> "Callable[..., Awaita
                 job_session_id = status.get("session_id")
                 if job_session_id:
                     tool_calls = await _flush_tool_call_trace(job_session_id)
-                    if tool_calls:
-                        status["tool_calls"] = tool_calls
+                    failed_tool_calls = _failed_tool_call_details(tool_calls)
+                    if failed_tool_calls:
+                        status["failed_tool_calls"] = failed_tool_calls
+            status.pop("tool_calls", None)
 
             return json.dumps(status, indent=2)
         except Exception as e:
