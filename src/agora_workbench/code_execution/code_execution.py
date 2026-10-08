@@ -6,7 +6,7 @@ import json
 import logging
 import os
 import sys
-from typing import Awaitable, Callable, Optional, TYPE_CHECKING
+from typing import Any, Awaitable, Callable, Optional, TYPE_CHECKING
 
 from fastapi import HTTPException
 from fastmcp import Context
@@ -108,6 +108,16 @@ def _saved_files_for_event(server: "CodeExecutionServer", session_id: str, artif
         }
         for a in artifacts
     ]
+
+
+def _agent_execution_payload(result: CodeExecutionResult | dict[str, Any]) -> dict[str, Any]:
+    """Return top-level execution data without internal tool-call traces."""
+    if isinstance(result, CodeExecutionResult):
+        return result.model_dump(exclude={"displays", "tool_calls"})
+    payload = dict(result)
+    payload.pop("tool_calls", None)
+    payload.pop("displays", None)
+    return payload
 
 
 def _absolute_path_error(val: str, allowed_prefixes: "tuple[str, ...]") -> str:
@@ -877,7 +887,7 @@ def build_tool(server: "CodeExecutionServer") -> "Callable[..., Awaitable[str]]"
             # payloads ride the activity event).  Lightweight artifact names are
             # included so the agent knows what files are available for publishing
             # via <gui>name</gui>.
-            result_dict = result.model_dump(exclude={"displays"})
+            result_dict = _agent_execution_payload(result)
             # Strip download tokens from artifact metadata — agent only needs
             # names/sizes to decide what to publish.
             result_dict["artifacts"] = [
@@ -903,7 +913,7 @@ def build_tool(server: "CodeExecutionServer") -> "Callable[..., Awaitable[str]]"
                 return json.dumps(e.detail, indent=2)
             LOGGER.error(f"Execution failed: {e}", exc_info=True)
             error_result = CodeExecutionResult(success=False, error=str(e), description=description)
-            error_dict = error_result.model_dump()
+            error_dict = _agent_execution_payload(error_result)
             if session:
                 error_dict["session_id"] = session.session_id
             server.activity_publisher.publish_nowait(
@@ -920,7 +930,7 @@ def build_tool(server: "CodeExecutionServer") -> "Callable[..., Awaitable[str]]"
         except Exception as e:
             LOGGER.error(f"Execution failed: {e}", exc_info=True)
             error_result = CodeExecutionResult(success=False, error=str(e), description=description)
-            error_dict = error_result.model_dump()
+            error_dict = _agent_execution_payload(error_result)
             if session:
                 error_dict["session_id"] = session.session_id
             server.activity_publisher.publish_nowait(
@@ -968,28 +978,6 @@ def build_tool(server: "CodeExecutionServer") -> "Callable[..., Awaitable[str]]"
 def build_check_job_tool(server: "CodeExecutionServer") -> "Callable[..., Awaitable[str]]":
     """Build a tool that checks status/output for a background code-execution job."""
 
-    async def _flush_tool_call_trace(session_id: str) -> list[dict]:
-        """Harvest tool-call records from a session kernel after a background job completes.
-
-        Returns a list of ToolCallRecord dicts, or empty on any failure.
-        """
-        from .tool_proxy import FLUSH_SNIPPET
-
-        if not server._tool_tracing_active(session_id):
-            return []
-        try:
-            trace_result = await server.session_manager.execute_code_for_session(
-                session_id=session_id, code=FLUSH_SNIPPET, timeout=10
-            )
-            stdout, _stderr, success, _displays, _artifacts = trace_result
-            if success and stdout:
-                raw_calls = json.loads(stdout.strip())
-                tool_calls = [ToolCallRecord(**record) for record in raw_calls]
-                return [record.model_dump() for record in server._truncate_tool_call_results(tool_calls)]
-        except Exception:
-            LOGGER.warning("Failed to flush tool-call trace for session %s", session_id)
-        return []
-
     async def check_job_tool(ctx: Context, job_id: str) -> str:
         """Check the status of a background code-execution job.
 
@@ -1014,13 +1002,7 @@ def build_check_job_tool(server: "CodeExecutionServer") -> "Callable[..., Awaita
             # and the URLs already ride the job_finished activity event.
             status.pop("artifacts", None)
 
-            # Flush tool-call trace when the job has completed
-            if status.get("status") in ("completed", "failed"):
-                job_session_id = status.get("session_id")
-                if job_session_id:
-                    tool_calls = await _flush_tool_call_trace(job_session_id)
-                    if tool_calls:
-                        status["tool_calls"] = tool_calls
+            status.pop("tool_calls", None)
 
             return json.dumps(status, indent=2)
         except Exception as e:

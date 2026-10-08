@@ -10,9 +10,11 @@ changes that require action from existing users. Each entry there states who is 
 
 ## [Unreleased]
 
-### Fixed
+### Changed
 
-- Bound serialized tool-call results using the configured output truncation threshold.
+- Code-execution MCP responses no longer include internal tool-call arguments
+  or results. Agents receive only top-level execution output, while complete
+  traces remain available to activity-event consumers.
 
 ## [0.3.3] - 2026-10-06
 
