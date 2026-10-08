@@ -580,15 +580,16 @@ async def _publish_job_finished_when_done(server: "CodeExecutionServer", session
     except Exception:
         return
     if final is None:
+        server.session_manager.complete_background_tool_trace(job_id, [])
         return
 
     # Flush tool-call trace from the kernel before publishing the event,
     # so the activity UI can display which domain tools were invoked.
     tool_calls: list[dict] = []
-    if server._tool_tracing_active(session_id):
-        from .tool_proxy import FLUSH_SNIPPET
+    try:
+        if server._tool_tracing_active(session_id):
+            from .tool_proxy import FLUSH_SNIPPET
 
-        try:
             trace_result = await server.session_manager.execute_code_for_session(
                 session_id=session_id, code=FLUSH_SNIPPET, timeout=10
             )
@@ -596,8 +597,13 @@ async def _publish_job_finished_when_done(server: "CodeExecutionServer", session
             if success and stdout:
                 raw_calls = json.loads(stdout.strip())
                 tool_calls = [ToolCallRecord(**record).model_dump() for record in raw_calls]
-        except Exception:
-            LOGGER.debug("Failed to flush tool-call trace for job_finished event (job %s)", job_id)
+    except Exception:
+        LOGGER.debug("Failed to flush tool-call trace for job_finished event (job %s)", job_id)
+    finally:
+        server.session_manager.complete_background_tool_trace(
+            job_id,
+            _failed_tool_call_details(tool_calls),
+        )
 
     server.activity_publisher.publish_nowait(
         {
@@ -1004,27 +1010,6 @@ def build_tool(server: "CodeExecutionServer") -> "Callable[..., Awaitable[str]]"
 def build_check_job_tool(server: "CodeExecutionServer") -> "Callable[..., Awaitable[str]]":
     """Build a tool that checks status/output for a background code-execution job."""
 
-    async def _flush_tool_call_trace(session_id: str) -> list[dict]:
-        """Harvest tool-call records from a session kernel after a background job completes.
-
-        Returns a list of ToolCallRecord dicts, or empty on any failure.
-        """
-        from .tool_proxy import FLUSH_SNIPPET
-
-        if not server._tool_tracing_active(session_id):
-            return []
-        try:
-            trace_result = await server.session_manager.execute_code_for_session(
-                session_id=session_id, code=FLUSH_SNIPPET, timeout=10
-            )
-            stdout, _stderr, success, _displays, _artifacts = trace_result
-            if success and stdout:
-                raw_calls = json.loads(stdout.strip())
-                return [ToolCallRecord(**record).model_dump() for record in raw_calls]
-        except Exception:
-            LOGGER.warning("Failed to flush tool-call trace for session %s", session_id)
-        return []
-
     async def check_job_tool(ctx: Context, job_id: str) -> str:
         """Check the status of a background code-execution job.
 
@@ -1049,14 +1034,13 @@ def build_check_job_tool(server: "CodeExecutionServer") -> "Callable[..., Awaita
             # and the URLs already ride the job_finished activity event.
             status.pop("artifacts", None)
 
-            # Flush tool-call trace when the job has completed
+            # The completion task is the sole destructive trace consumer. Wait
+            # for its cached failure projection so activity publication and
+            # repeated polling observe the same execution.
             if status.get("status") in ("completed", "failed"):
-                job_session_id = status.get("session_id")
-                if job_session_id:
-                    tool_calls = await _flush_tool_call_trace(job_session_id)
-                    failed_tool_calls = _failed_tool_call_details(tool_calls)
-                    if failed_tool_calls:
-                        status["failed_tool_calls"] = failed_tool_calls
+                failed_tool_calls = await server.session_manager.await_background_tool_failures(job_id)
+                if failed_tool_calls:
+                    status["failed_tool_calls"] = failed_tool_calls
             status.pop("tool_calls", None)
 
             return json.dumps(status, indent=2)

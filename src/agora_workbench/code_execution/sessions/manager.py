@@ -162,6 +162,8 @@ class _BackgroundJob:
     # before/after pattern in :meth:`_execute_code_locked`.
     outputs_before: dict[str, Tuple[int, float]] = field(default_factory=dict)
     artifacts: list[dict] = field(default_factory=list)
+    failed_tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    tool_trace_ready: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class SessionConfig:
@@ -2056,6 +2058,22 @@ class SessionManager:
         # base URL is known (matches the foreground path's contract).
         result["artifacts"] = list(job.artifacts)
         return result
+
+    def complete_background_tool_trace(self, job_id: str, failed_tool_calls: list[dict[str, Any]]) -> None:
+        """Store the Agent-facing failure projection and release waiting pollers."""
+        job = self._background_jobs.get(job_id)
+        if job is None:
+            return
+        job.failed_tool_calls = list(failed_tool_calls)
+        job.tool_trace_ready.set()
+
+    async def await_background_tool_failures(self, job_id: str) -> list[dict[str, Any]]:
+        """Wait until the completion task has harvested the job's tool trace."""
+        job = self._background_jobs.get(job_id)
+        if job is None:
+            return []
+        await job.tool_trace_ready.wait()
+        return list(job.failed_tool_calls)
 
     async def await_background_job(self, job_id: str) -> Optional[dict[str, Any]]:
         """Wait for a background job's task to reach a terminal state, then return its status.

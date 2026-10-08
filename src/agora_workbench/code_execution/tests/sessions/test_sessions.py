@@ -1257,6 +1257,42 @@ class TestBackgroundArtifactPipeline:
 
     @pytest.mark.unit
     @pytest.mark.asyncio
+    async def test_background_tool_failures_are_shared_with_waiting_and_repeated_pollers(self, tmp_path, monkeypatch):
+        from ...sessions.manager import _BackgroundJob
+
+        manager = self._make_manager(tmp_path, monkeypatch)
+        session_id = manager.create_session(data={}, user_identity="u", user_token="t", token_claims={})
+        job = _BackgroundJob(
+            job_id="j_trace",
+            session_id=session_id,
+            msg_id="m",
+            timeout=1.0,
+            start_time=0.0,
+            status="failed",
+            completed_at=0.5,
+        )
+        manager._background_jobs[job.job_id] = job
+        failures = [
+            {
+                "call_index": 2,
+                "tool_name": "failed_tool",
+                "duration_ms": 20.0,
+                "success": False,
+                "error": "RuntimeError: failed",
+            }
+        ]
+
+        waiting_poll = asyncio.create_task(manager.await_background_tool_failures(job.job_id))
+        await asyncio.sleep(0)
+        assert not waiting_poll.done()
+
+        manager.complete_background_tool_trace(job.job_id, failures)
+
+        assert await waiting_poll == failures
+        assert await manager.await_background_tool_failures(job.job_id) == failures
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
     async def test_start_background_seeds_outputs_preamble_and_snapshot(self, tmp_path, monkeypatch):
         """start_background_execution_for_session prepends the outputs preamble
         (so kernels whose FIRST execute is background still get
