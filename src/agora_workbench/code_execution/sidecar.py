@@ -15,7 +15,7 @@ declared on a :class:`ServerConfig`. It:
 * launches the process bound to loopback,
 * waits for the sidecar's health endpoint to report ready,
 * exports the sidecar base URL into ``os.environ`` under the configured
-  ``url_env_var`` so every subsequently-spawned kernel inherits it, and
+  ``url_env_var`` for the server to pass explicitly to subsequent kernels, and
 * terminates the processes on shutdown (graceful SIGTERM, then SIGKILL).
 """
 
@@ -100,8 +100,8 @@ class SidecarManager:
 
         await self._await_ready(spec, proc)
 
-        # Publish the discovery URL so kernels (which copy os.environ at spawn)
-        # can reach the sidecar. Mirrors how MCP_ASSET_CACHE_DIR is exposed.
+        # Publish the discovery URL for server-side compatibility. The server
+        # passes this URL explicitly to kernels rather than copying os.environ.
         os.environ[spec.url_env_var] = spec.base_url()
         self._injected_env_vars[spec.name] = spec.url_env_var
         LOGGER.info(
