@@ -29,7 +29,6 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger(__name__)
 
 _MAX_AGENT_FAILED_TOOL_CALLS = 8
-_MAX_AGENT_TOOL_ERROR_CHARS = 500
 
 
 # block file system calls that agent might use to cross session isolation boundary
@@ -113,13 +112,6 @@ def _saved_files_for_event(server: "CodeExecutionServer", session_id: str, artif
     ]
 
 
-def _bounded_tool_error(error: str) -> str:
-    if len(error) <= _MAX_AGENT_TOOL_ERROR_CHARS:
-        return error
-    suffix = "... [truncated]"
-    return error[: _MAX_AGENT_TOOL_ERROR_CHARS - len(suffix)] + suffix
-
-
 def _failed_tool_call_summary(tool_calls: list[ToolCallRecord | dict[str, Any]]) -> dict[str, Any]:
     """Return a bounded, argument-free summary of internal tool failures."""
     failures: list[dict[str, Any]] = []
@@ -138,6 +130,7 @@ def _failed_tool_call_summary(tool_calls: list[ToolCallRecord | dict[str, Any]])
         error = call.error or (result_error if isinstance(result_error, str) else None)
         if not error:
             error = "Tool returned success=false without an error message."
+        # Raw errors distinguish failures but must not enter the agent payload.
         summary_key = (call.tool_name, error)
 
         existing_index = summary_indexes.get(summary_key)
@@ -153,7 +146,7 @@ def _failed_tool_call_summary(tool_calls: list[ToolCallRecord | dict[str, Any]])
             {
                 "first_call_index": call_index,
                 "tool_name": call.tool_name,
-                "error": _bounded_tool_error(error),
+                "error": "Tool call failed." if not call.success else "Tool returned success=false.",
                 "occurrences": 1,
             }
         )

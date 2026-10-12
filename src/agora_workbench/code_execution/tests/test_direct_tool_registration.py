@@ -108,12 +108,12 @@ async def test_execute_tool_returns_bounded_failed_internal_tool_calls():
                     result={"large": "not returned"},
                     duration_ms=20,
                     success=False,
-                    error="ValueError: invalid input",
+                    error="ValueError: request https://example.invalid/?token=proxy-secret failed",
                 ),
                 ToolCallRecord(
                     tool_name="domain_failure",
                     args={"secret": "also not returned"},
-                    result={"success": False, "error": "Invalid split specification"},
+                    result={"success": False, "error": "Invalid split specification: domain-secret"},
                     duration_ms=30,
                     success=True,
                 ),
@@ -136,19 +136,25 @@ async def test_execute_tool_returns_bounded_failed_internal_tool_calls():
         {
             "first_call_index": 2,
             "tool_name": "failed_tool",
-            "error": "ValueError: invalid input",
+            "error": "Tool call failed.",
             "occurrences": 1,
         },
         {
             "first_call_index": 3,
             "tool_name": "domain_failure",
-            "error": "Invalid split specification",
+            "error": "Tool returned success=false.",
             "occurrences": 1,
         },
     ]
     serialized = json.dumps(payload)
     assert "not returned" not in serialized
     assert "secret" not in serialized
+    assert "example.invalid" not in serialized
+    activity_event = server.activity_publisher.publish_nowait.call_args.args[0]
+    assert activity_event["tool_calls"][1]["error"] == (
+        "ValueError: request https://example.invalid/?token=proxy-secret failed"
+    )
+    assert activity_event["tool_calls"][2]["result"]["error"] == "Invalid split specification: domain-secret"
 
 
 @pytest.mark.unit
@@ -207,13 +213,13 @@ async def test_execute_tool_bounds_and_deduplicates_failed_internal_tool_calls()
     assert payload["failed_tool_calls_truncated"] is True
     assert len(payload["failed_tool_calls"]) == 8
     assert payload["failed_tool_calls"][0]["occurrences"] == 2
-    assert payload["failed_tool_calls"][0]["error"].endswith("... [truncated]")
-    assert len(payload["failed_tool_calls"][0]["error"]) == 500
+    assert payload["failed_tool_calls"][0]["error"] == "Tool returned success=false."
+    assert repeated_error not in json.dumps(payload)
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_execute_tool_does_not_deduplicate_distinct_truncated_errors():
+async def test_execute_tool_does_not_deduplicate_distinct_private_errors():
     server = CodeExecutionServer(
         server_config=ServerConfig(
             name="test_direct",
@@ -252,3 +258,5 @@ async def test_execute_tool_does_not_deduplicate_distinct_truncated_errors():
     assert payload["failed_tool_call_count"] == 2
     assert len(payload["failed_tool_calls"]) == 2
     assert payload["failed_tool_calls_truncated"] is False
+    assert all(failure["error"] == "Tool call failed." for failure in payload["failed_tool_calls"])
+    assert shared_prefix not in json.dumps(payload)
