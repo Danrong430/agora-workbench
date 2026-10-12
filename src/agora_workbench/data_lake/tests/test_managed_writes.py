@@ -974,23 +974,37 @@ async def test_reconciliation_defers_heartbeating_slow_writer(tmp_path, monkeypa
     lake = tmp_path / "lake"
     backend = LocalManagedStorage(lake)
     created = asyncio.Event()
+    release_create = asyncio.Event()
+    heartbeat = asyncio.Event()
     original = backend.create_from_file
 
     async def slow_create(*args):
         version = await original(*args)
         created.set()
-        await asyncio.sleep(0.15)
+        await release_create.wait()
         return version
 
     monkeypatch.setattr(backend, "create_from_file", slow_create)
-    writer = ManagedCatalogWriter("managed", backend, operation_lease_seconds=0.03)
+    writer = ManagedCatalogWriter("managed", backend, operation_lease_seconds=0.3)
+    original_update = writer._update_operation
+
+    async def track_heartbeat(operation_id, lease_id, **updates):
+        await original_update(operation_id, lease_id, **updates)
+        if not updates:
+            heartbeat.set()
+
+    monkeypatch.setattr(writer, "_update_operation", track_heartbeat)
     upload = asyncio.create_task(writer.upload(UploadArtifactRequest("slow-op", "artifact.txt", source)))
     await created.wait()
-    await asyncio.sleep(0.06)
+    heartbeat.clear()
+    await asyncio.wait_for(heartbeat.wait(), timeout=2)
 
-    report = await writer.reconcile(grace_seconds=0)
-    assert report.deferred == ("slow-op",)
+    try:
+        report = await writer.reconcile(grace_seconds=0)
+    finally:
+        release_create.set()
     result = await upload
+    assert report.deferred == ("slow-op",)
     assert (lake / str(result.storage_path)).read_text() == "slow"
 
 
