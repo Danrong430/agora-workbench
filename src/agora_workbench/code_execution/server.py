@@ -77,6 +77,23 @@ logging.getLogger("azure.identity").setLevel(logging.WARNING)
 LOGGER = logging.getLogger(__name__)
 
 
+class _ParallelBatchResources:
+    """Keep parallel batches owned by the parent session's cleanup lifecycle."""
+
+    def __init__(self, server: "CodeExecutionServer") -> None:
+        self.server = server
+        self.batch_ids: set[str] = set()
+
+    async def aclose(self) -> None:
+        for batch_id in tuple(self.batch_ids):
+            try:
+                await self.server._cancel_batch_payload(batch_id)
+            except ValueError:
+                # A concurrent check/cancel may already have retired this batch.
+                if batch_id in self.server._parallel_batches:
+                    raise
+
+
 class CodeExecutionServer(BaseMCPServer):
     """
     Base class for MCP code execution servers.
@@ -2461,15 +2478,20 @@ else:
         """
         async with self._parallel_state_lock:
             batch = self._parallel_batches.get(batch_id)
-            if not batch or batch.get("cleanup_done"):
+            if not batch:
                 return
             session_ids = [self._parallel_jobs[job_id]["session_id"] for job_id in batch["job_ids"]]
-            batch["cleanup_done"] = True
+            cleanup_task = batch.get("cleanup_task")
+            if cleanup_task is None:
+                cleanup_task = asyncio.gather(
+                    *(self.session_manager.aclose_session(session_id) for session_id in session_ids),
+                    return_exceptions=True,
+                )
+                batch["cleanup_task"] = cleanup_task
 
-        results = await asyncio.gather(
-            *(self.session_manager.aclose_session(session_id) for session_id in session_ids),
-            return_exceptions=True,
-        )
+        # Concurrent parent close/check/cancel must join the same child teardown.
+        results = await asyncio.shield(cleanup_task)
+        batch["cleanup_done"] = True
         for session_id, result in zip(session_ids, results):
             if isinstance(result, BaseException):
                 LOGGER.debug("Failed to close parallel child session %s", session_id, exc_info=result)
@@ -2483,6 +2505,7 @@ else:
         async with self._parallel_state_lock:
             batch = self._parallel_batches.pop(batch_id, None)
             if batch:
+                batch["resources"].batch_ids.discard(batch_id)
                 for job_id in batch["job_ids"]:
                     job = self._parallel_jobs.pop(job_id, None)
                     if job:
@@ -2594,9 +2617,14 @@ else:
         batch_id = f"b_{uuid.uuid4().hex[:12]}"
         jobs_out: list[dict[str, Any]] = []
         async with self._parallel_state_lock:
+            if self.session_manager.get_session(parent_session.session_id) is not parent_session:
+                raise ValueError(f"Session {parent_session.session_id} was replaced or is closing")
+            resources = parent_session.extensions.setdefault("_agora_parallel_batches", _ParallelBatchResources(self))
+            resources.batch_ids.add(batch_id)
             self._parallel_batches[batch_id] = {
                 "batch_id": batch_id,
                 "parent_session_id": parent_session.session_id,
+                "resources": resources,
                 "created_at": time.monotonic(),
                 "job_ids": [],
                 "result_variable": result_variable,
@@ -2680,6 +2708,12 @@ else:
 
         if active_tasks:
             await asyncio.gather(*active_tasks, return_exceptions=True)
+        async with self._parallel_state_lock:
+            for job_id in job_ids:
+                job = self._parallel_jobs.get(job_id)
+                # A task cancelled before its first step never runs its handler.
+                if job is not None and job["status"] == "running":
+                    job.update({"status": "cancelled", "completed_at": time.monotonic()})
         await self._cleanup_parallel_batch_sessions(batch_id)
         payload = await self._check_batch_payload(batch_id)
         payload["status"] = "partial_failure" if payload["failed"] else payload["status"]
