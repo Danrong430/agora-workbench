@@ -10,6 +10,12 @@ changes that require action from existing users. Each entry there states who is 
 
 ## [Unreleased]
 
+### Fixed
+
+- Closing a parent session now cancels its parallel jobs, waits for child
+  sessions to close, and retires batch state, including worker-thread closure
+  ([#401](https://github.com/microsoft/agora-workbench/pull/401)).
+
 ## [0.4.1] - 2026-10-13
 
 ### Added
