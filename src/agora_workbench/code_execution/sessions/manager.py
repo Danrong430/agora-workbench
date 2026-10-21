@@ -859,6 +859,7 @@ class SessionManager:
                     job.success = False
                     job.error = f"Session {session_id} was closed while job {running_job_id} was running"
                     job.status = "failed"
+                    self._mark_job_finished(job)
                     if job.task and not job.task.done():
                         job.task.cancel()
 
@@ -2084,17 +2085,21 @@ class SessionManager:
         """Wait for a background job's task to reach a terminal state, then return its status.
 
         Returns ``None`` if the job was never registered or has already been purged.
-        Used by the activity publisher to emit ``job_finished`` events; callers must
-        treat exceptions on the underlying task as terminal (a failed task still
-        leaves ``_BackgroundJob.status`` set by ``_collect_background_job``).
+        Used by the activity publisher to emit ``job_finished`` events. A task that
+        raised or was cancelled (for example by ``close_session``) is terminal: the
+        snapshot reflects the status recorded by the collector or by the canceller.
+        Cancelling this waiter does not cancel the underlying job.
         """
         job = self._background_jobs.get(job_id)
         if job is None or job.task is None:
             return None
-        try:
-            await job.task
-        except Exception:
-            LOGGER.debug("Background job task raised for job_id=%s", job_id, exc_info=True)
+        task = job.task
+        # asyncio.wait neither re-raises the task's outcome nor cancels the task
+        # when this waiter is cancelled: a job cancelled by close/teardown still
+        # reaches a terminal snapshot, and cancelling the waiter leaves the job running.
+        await asyncio.wait((task,))
+        if not task.cancelled() and task.exception() is not None:
+            LOGGER.debug("Background job task raised for job_id=%s", job_id, exc_info=task.exception())
         try:
             return self.check_background_job(job_id)
         except ValueError:
@@ -2546,6 +2551,12 @@ class SessionManager:
         if running_job_id:
             job = self._background_jobs.get(running_job_id)
             if job:
+                # Record the terminal state before cancelling so waiters woken by the
+                # cancellation never observe a cancelled job still marked "running".
+                job.success = False
+                job.error = f"Kernel for session {session_id} was shut down while job {running_job_id} was running"
+                job.status = "failed"
+                self._mark_job_finished(job)
                 if job.task and not job.task.done():
                     job.task.cancel()
                     try:
@@ -2554,10 +2565,6 @@ class SessionManager:
                         pass
                     except Exception:
                         LOGGER.debug("Background job task cleanup failed during kernel shutdown", exc_info=True)
-                job.success = False
-                job.error = f"Kernel for session {session_id} was shut down while job {running_job_id} was running"
-                job.status = "failed"
-                self._mark_job_finished(job)
 
         LOGGER.info(f"Shutting down kernel for session {session_id}")
         try:
