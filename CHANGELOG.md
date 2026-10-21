@@ -10,6 +10,13 @@ changes that require action from existing users. Each entry there states who is 
 
 ## [Unreleased]
 
+### Fixed
+
+- Background jobs cancelled by `close_session` or kernel teardown now emit
+  exactly one failed `job_finished` activity event instead of none, and are
+  finalized so they can be purged. Cancelling the activity waiter no longer
+  cancels the background job it is waiting on.
+
 ## [0.4.1] - 2026-10-13
 
 ### Added
