@@ -10,7 +10,7 @@ from ..auth import create_noop_auth_config
 from ..code_execution_models import CodeExecutionResult
 
 
-@pytest_asyncio.fixture
+@pytest_asyncio.fixture(loop_scope="function")
 async def parallel_server(tmp_path, monkeypatch):
     server = CodeExecutionServer(
         server_config=ServerConfig(
@@ -58,7 +58,7 @@ async def start_batch(server, parent):
     )
 
 
-@pytest.mark.parametrize("close_path", ["async", "sync", "tool"])
+@pytest.mark.parametrize("close_path", ["async", "sync", "thread", "foreign_loop", "tool"])
 async def test_parent_close_cancels_children_and_retires_batches(parallel_server, close_path):
     server, started = parallel_server
     server._parallel_semaphore = asyncio.Semaphore(1)
@@ -75,6 +75,12 @@ async def test_parent_close_cancels_children_and_retires_batches(parallel_server
     elif close_path == "sync":
         server.session_manager.close_session(parent.session_id)
         await server.session_manager.await_resource_cleanup()
+    elif close_path == "thread":
+        await asyncio.wait_for(asyncio.to_thread(server.session_manager.close_session, parent.session_id), timeout=5)
+    elif close_path == "foreign_loop":
+        await asyncio.wait_for(
+            asyncio.to_thread(lambda: asyncio.run(server.session_manager.aclose_session(parent.session_id))), timeout=5
+        )
     else:
         await server.session_manager.aclose_session(parent.session_id)
 
@@ -189,3 +195,40 @@ async def test_parent_close_joins_concurrent_batch_cleanup(parallel_server, monk
     assert not server._parallel_batches
     assert not server._parallel_jobs
     assert server.session_manager.storage.count() == 0
+
+
+async def test_cancelled_cleanup_waiter_can_rejoin_retained_teardown(parallel_server, monkeypatch):
+    server, started = parallel_server
+    parent = create_parent(server)
+    batch = await start_batch(server, parent)
+    await started.wait()
+    child = server.session_manager.get_session(batch["jobs"][0]["session_id"])
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    original_close = child.aclose
+
+    async def blocked_close():
+        cleanup_started.set()
+        await release_cleanup.wait()
+        await original_close()
+
+    monkeypatch.setattr(child, "aclose", blocked_close)
+    resources = parent.extensions["_agora_parallel_batches"]
+    waiter = asyncio.create_task(resources.aclose())
+    await cleanup_started.wait()
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    drain = asyncio.create_task(resources.aclose())
+    try:
+        await asyncio.sleep(0)
+        assert not drain.done()
+        assert batch["batch_id"] in server._parallel_batches
+    finally:
+        release_cleanup.set()
+        await drain
+
+    assert not server._parallel_batches
+    assert not server._parallel_jobs
+    assert server.session_manager.storage.count() == 1

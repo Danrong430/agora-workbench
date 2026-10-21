@@ -83,8 +83,25 @@ class _ParallelBatchResources:
     def __init__(self, server: "CodeExecutionServer") -> None:
         self.server = server
         self.batch_ids: set[str] = set()
+        self._loop = asyncio.get_running_loop()
+        self._cleanup_task: asyncio.Task[None] | None = None
 
     async def aclose(self) -> None:
+        if not self.batch_ids and self._cleanup_task is None:
+            return
+        if self._cleanup_task is not None and self._cleanup_task.done():
+            self._cleanup_task.result()
+            return
+        if asyncio.get_running_loop() is not self._loop:
+            completion = asyncio.run_coroutine_threadsafe(self.aclose(), self._loop)
+            await asyncio.shield(asyncio.wrap_future(completion))
+            return
+        if self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._close_batches())
+        # Retain and shield teardown so concurrent/cancelled waiters can rejoin it.
+        await asyncio.shield(self._cleanup_task)
+
+    async def _close_batches(self) -> None:
         for batch_id in tuple(self.batch_ids):
             try:
                 await self.server._cancel_batch_payload(batch_id)
