@@ -2385,3 +2385,93 @@ class TestParallelBatchCleanup:
 
         # A second pass must be inert rather than re-closing sessions.
         await CodeExecutionServer._cleanup_parallel_batch_sessions(server, "b1")
+
+
+# ---------------------------------------------------------------------------
+# Cancelled background jobs still publish their terminal activity event
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestCancelledBackgroundJobEvents:
+    """Closing or tearing down a session cancels its running background job.
+
+    The ``job_finished`` publisher waits on the job task; cancelling that task
+    must surface as a terminal ``job_finished`` event rather than silently
+    ending the publisher, and cancelling the publisher must not cancel the job.
+    """
+
+    @staticmethod
+    def _start_job(manager: SessionManager, session_id: str) -> _BackgroundJob:
+        job = _BackgroundJob(
+            job_id="job-1",
+            session_id=session_id,
+            msg_id="m1",
+            timeout=600.0,
+            start_time=time.monotonic(),
+        )
+        job.task = asyncio.create_task(asyncio.sleep(3600))
+        manager._background_jobs[job.job_id] = job
+        manager._session_running_jobs[session_id] = job.job_id
+        return job
+
+    @staticmethod
+    def _start_publisher(manager: SessionManager, session_id: str, job_id: str):
+        from ..code_execution import _publish_job_finished_when_done
+
+        events: list[dict] = []
+        server = SimpleNamespace(
+            session_manager=manager,
+            activity_publisher=SimpleNamespace(publish_nowait=events.append),
+            _tool_tracing_active=lambda _sid: False,
+        )
+        publisher = asyncio.create_task(_publish_job_finished_when_done(cast(Any, server), session_id, job_id))
+        return publisher, events
+
+    async def test_close_session_publishes_job_finished_once(self, manager):
+        session_id = manager.create_session(data={}, user_identity="u", user_token="t", token_claims={})
+        job = self._start_job(manager, session_id)
+        publisher, events = self._start_publisher(manager, session_id, job.job_id)
+        await asyncio.sleep(0)
+
+        await manager.aclose_session(session_id)
+        await asyncio.wait_for(publisher, timeout=5)
+
+        finished = [e for e in events if e["type"] == "job_finished"]
+        assert len(finished) == 1
+        assert finished[0]["job_id"] == job.job_id
+        assert finished[0]["success"] is False
+        assert "was closed while job" in finished[0]["error"]
+        assert job.status == "failed"
+        assert job.completed_at is not None, "a closed job must be finalized so it can be purged"
+        assert session_id not in manager._session_running_jobs
+
+    async def test_kernel_shutdown_publishes_failed_job_finished(self, manager):
+        session_id = manager.create_session(data={}, user_identity="u", user_token="t", token_claims={})
+        register_kernel(manager, session_id)
+        job = self._start_job(manager, session_id)
+        publisher, events = self._start_publisher(manager, session_id, job.job_id)
+        await asyncio.sleep(0)
+
+        await manager._shutdown_kernel(session_id)
+        await asyncio.wait_for(publisher, timeout=5)
+
+        assert [(e["type"], e["success"]) for e in events] == [("job_finished", False)]
+        assert events[0]["description"] == f"job {job.job_id} failed"
+        assert "was shut down while job" in events[0]["error"]
+
+    async def test_cancelling_publisher_does_not_cancel_job(self, manager):
+        session_id = manager.create_session(data={}, user_identity="u", user_token="t", token_claims={})
+        job = self._start_job(manager, session_id)
+        publisher, events = self._start_publisher(manager, session_id, job.job_id)
+        await asyncio.sleep(0)
+
+        publisher.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await publisher
+
+        await asyncio.sleep(0)
+        assert not job.task.done(), "cancelling the activity waiter cancelled the background job"
+        assert job.status == "running"
+        assert events == []
+        job.task.cancel()

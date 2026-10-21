@@ -15,6 +15,10 @@ changes that require action from existing users. Each entry there states who is 
 - Closing a parent session now cancels its parallel jobs, waits for child
   sessions to close, and retires batch state, including worker-thread closure
   ([#401](https://github.com/microsoft/agora-workbench/pull/401)).
+- Background jobs cancelled by `close_session` or kernel teardown now emit
+  exactly one failed `job_finished` activity event instead of none, and are
+  finalized so they can be purged. Cancelling the activity waiter no longer
+  cancels the background job it is waiting on.
 
 ## [0.4.1] - 2026-10-13
 
